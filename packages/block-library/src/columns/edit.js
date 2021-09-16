@@ -2,19 +2,20 @@
  * External dependencies
  */
 import classnames from 'classnames';
-import { dropRight, get, times } from 'lodash';
+import { get, times } from 'lodash';
 
 /**
  * WordPress dependencies
  */
 import { __ } from '@wordpress/i18n';
 import {
+	BaseControl,
 	Notice,
 	PanelBody,
-	RangeControl,
+	__experimentalRadio as Radio,
+	__experimentalRadioGroup as RadioGroup,
 	ToggleControl,
 } from '@wordpress/components';
-
 import {
 	InspectorControls,
 	__experimentalUseInnerBlocksProps as useInnerBlocksProps,
@@ -24,12 +25,13 @@ import {
 	useBlockProps,
 	store as blockEditorStore,
 } from '@wordpress/block-editor';
-import { withDispatch, useDispatch, useSelect } from '@wordpress/data';
+import { useDispatch, useSelect } from '@wordpress/data';
 import {
 	createBlock,
 	createBlocksFromInnerBlocksTemplate,
 	store as blocksStore,
 } from '@wordpress/blocks';
+import { useEffect, useState } from '@wordpress/element';
 
 /**
  * Internal dependencies
@@ -52,23 +54,132 @@ import {
  */
 const ALLOWED_BLOCKS = [ 'core/column' ];
 
-function ColumnsEditContainer( {
-	attributes,
-	setAttributes,
-	updateAlignment,
-	updateColumns,
-	clientId,
-} ) {
+function ColumnsEdit( { attributes, setAttributes, clientId } ) {
 	const { isStackedOnMobile, verticalAlignment } = attributes;
 
-	const { count } = useSelect(
-		( select ) => {
-			return {
-				count: select( blockEditorStore ).getBlockCount( clientId ),
-			};
-		},
+	const { getBlockOrder, getBlocks } = useSelect(
+		( select ) => select( blockEditorStore ),
 		[ clientId ]
 	);
+
+	const innerBlockClientIds = getBlockOrder( clientId );
+	const [ count, setCount ] = useState();
+	const vacantIndexes = innerBlockClientIds.reduce(
+		( vacants, id, index ) =>
+			getBlockOrder( id ).length ? vacants : [ ...vacants, index ],
+		[]
+	);
+
+	// Keeps count synced with actual inner block length. An approach that
+	// could avoid this not even have count as state would be nice.
+	useEffect( () => {
+		if ( count !== innerBlockClientIds.length ) {
+			setCount( innerBlockClientIds.length );
+		}
+	}, [ innerBlockClientIds.length, count ] );
+
+	const { updateBlockAttributes, replaceInnerBlocks } = useDispatch(
+		blockEditorStore
+	);
+
+	/**
+	 * Update all child Column blocks with a new vertical alignment setting
+	 * based on whatever alignment is passed in. This allows change to parent
+	 * to overide anything set on a individual column basis.
+	 *
+	 * @param {string} nextAlignment the vertical alignment setting
+	 */
+	const updateAlignment = ( nextAlignment ) => {
+		// Update own alignment.
+		setAttributes( { verticalAlignment: nextAlignment } );
+
+		// Update all child Column Blocks to match
+		innerBlockClientIds.forEach( ( innerBlockClientId ) => {
+			updateBlockAttributes( innerBlockClientId, {
+				verticalAligment: nextAlignment,
+			} );
+		} );
+	};
+
+	/**
+	 * Updates the column count, including necessary revisions to child Column
+	 * blocks to grant required or redistribute available space.
+	 *
+	 * @param {number} previousColumns Previous column count.
+	 * @param {number} newColumns      New column count.
+	 */
+	const updateColumns = ( previousColumns, newColumns ) => {
+		let innerBlocks = getBlocks( clientId );
+		const hasExplicitWidths = hasExplicitPercentColumnWidths( innerBlocks );
+
+		// Redistribute available width for existing inner blocks.
+		const isAddingColumn = newColumns > previousColumns;
+
+		if ( isAddingColumn && hasExplicitWidths ) {
+			// If adding a new column, assign width to the new column equal to
+			// as if it were `1 / columns` of the total available space.
+			const newColumnWidth = toWidthPrecision( 100 / newColumns );
+
+			// Redistribute in consideration of pending block insertion as
+			// constraining the available working width.
+			const widths = getRedistributedColumnWidths(
+				innerBlocks,
+				100 - newColumnWidth
+			);
+
+			innerBlocks = [
+				...getMappedColumnWidths( innerBlocks, widths ),
+				...times( newColumns - previousColumns, () => {
+					return createBlock( 'core/column', {
+						width: `${ newColumnWidth }%`,
+					} );
+				} ),
+			];
+		} else if ( isAddingColumn ) {
+			innerBlocks = [
+				...innerBlocks,
+				...times( newColumns - previousColumns, () => {
+					return createBlock( 'core/column' );
+				} ),
+			];
+		} else {
+			// Removes vacant columns
+			const difference = previousColumns - newColumns;
+			const indexesToRemove = vacantIndexes.slice( -difference );
+			innerBlocks = innerBlocks.filter(
+				( item, index ) => ! indexesToRemove.includes( index )
+			);
+
+			if ( hasExplicitWidths ) {
+				// Redistribute as if block is already removed.
+				const widths = getRedistributedColumnWidths( innerBlocks, 100 );
+
+				innerBlocks = getMappedColumnWidths( innerBlocks, widths );
+			}
+		}
+
+		replaceInnerBlocks( clientId, innerBlocks );
+		setCount( innerBlocks.length );
+	};
+
+	const columnsMin = Math.max( 1, count - vacantIndexes.length );
+	const columnsMax = 6;
+	const columnsRadioList = [];
+	for ( let i = 1; i <= columnsMax; i++ ) {
+		const disabled = i < columnsMin;
+		columnsRadioList.push(
+			<Radio key={ i } { ...{ disabled, value: i } }>
+				{ i }
+			</Radio>
+		);
+	}
+	if ( count > columnsMax ) {
+		columnsRadioList.push(
+			<Radio key={ count } value={ count }>
+				{ count }
+			</Radio>
+		);
+	}
 
 	const classes = classnames( {
 		[ `are-vertically-aligned-${ verticalAlignment }` ]: verticalAlignment,
@@ -93,14 +204,22 @@ function ColumnsEditContainer( {
 				/>
 			</BlockControls>
 			<InspectorControls>
-				<PanelBody>
-					<RangeControl
-						label={ __( 'Columns' ) }
-						value={ count }
-						onChange={ ( value ) => updateColumns( count, value ) }
-						min={ 1 }
-						max={ Math.max( 6, count ) }
-					/>
+				<PanelBody title={ __( 'Columns' ) }>
+					<BaseControl>
+						<RadioGroup
+							label={ __( 'Quantity' ) }
+							onChange={ ( value ) => {
+								// Somehow keyboard input is has this fire
+								// twice so this avoids the extra one
+								if ( value !== count ) {
+									updateColumns( count, value );
+								}
+							} }
+							checked={ count }
+						>
+							{ columnsRadioList }
+						</RadioGroup>
+					</BaseControl>
 					{ count > 6 && (
 						<Notice status="warning" isDismissible={ false }>
 							{ __(
@@ -123,102 +242,6 @@ function ColumnsEditContainer( {
 		</>
 	);
 }
-
-const ColumnsEditContainerWrapper = withDispatch(
-	( dispatch, ownProps, registry ) => ( {
-		/**
-		 * Update all child Column blocks with a new vertical alignment setting
-		 * based on whatever alignment is passed in. This allows change to parent
-		 * to overide anything set on a individual column basis.
-		 *
-		 * @param {string} verticalAlignment the vertical alignment setting
-		 */
-		updateAlignment( verticalAlignment ) {
-			const { clientId, setAttributes } = ownProps;
-			const { updateBlockAttributes } = dispatch( blockEditorStore );
-			const { getBlockOrder } = registry.select( blockEditorStore );
-
-			// Update own alignment.
-			setAttributes( { verticalAlignment } );
-
-			// Update all child Column Blocks to match
-			const innerBlockClientIds = getBlockOrder( clientId );
-			innerBlockClientIds.forEach( ( innerBlockClientId ) => {
-				updateBlockAttributes( innerBlockClientId, {
-					verticalAlignment,
-				} );
-			} );
-		},
-
-		/**
-		 * Updates the column count, including necessary revisions to child Column
-		 * blocks to grant required or redistribute available space.
-		 *
-		 * @param {number} previousColumns Previous column count.
-		 * @param {number} newColumns      New column count.
-		 */
-		updateColumns( previousColumns, newColumns ) {
-			const { clientId } = ownProps;
-			const { replaceInnerBlocks } = dispatch( blockEditorStore );
-			const { getBlocks } = registry.select( blockEditorStore );
-
-			let innerBlocks = getBlocks( clientId );
-			const hasExplicitWidths = hasExplicitPercentColumnWidths(
-				innerBlocks
-			);
-
-			// Redistribute available width for existing inner blocks.
-			const isAddingColumn = newColumns > previousColumns;
-
-			if ( isAddingColumn && hasExplicitWidths ) {
-				// If adding a new column, assign width to the new column equal to
-				// as if it were `1 / columns` of the total available space.
-				const newColumnWidth = toWidthPrecision( 100 / newColumns );
-
-				// Redistribute in consideration of pending block insertion as
-				// constraining the available working width.
-				const widths = getRedistributedColumnWidths(
-					innerBlocks,
-					100 - newColumnWidth
-				);
-
-				innerBlocks = [
-					...getMappedColumnWidths( innerBlocks, widths ),
-					...times( newColumns - previousColumns, () => {
-						return createBlock( 'core/column', {
-							width: `${ newColumnWidth }%`,
-						} );
-					} ),
-				];
-			} else if ( isAddingColumn ) {
-				innerBlocks = [
-					...innerBlocks,
-					...times( newColumns - previousColumns, () => {
-						return createBlock( 'core/column' );
-					} ),
-				];
-			} else {
-				// The removed column will be the last of the inner blocks.
-				innerBlocks = dropRight(
-					innerBlocks,
-					previousColumns - newColumns
-				);
-
-				if ( hasExplicitWidths ) {
-					// Redistribute as if block is already removed.
-					const widths = getRedistributedColumnWidths(
-						innerBlocks,
-						100
-					);
-
-					innerBlocks = getMappedColumnWidths( innerBlocks, widths );
-				}
-			}
-
-			replaceInnerBlocks( clientId, innerBlocks );
-		},
-	} )
-)( ColumnsEditContainer );
 
 function Placeholder( { clientId, name, setAttributes } ) {
 	const { blockType, defaultVariation, variations } = useSelect(
@@ -266,18 +289,16 @@ function Placeholder( { clientId, name, setAttributes } ) {
 	);
 }
 
-const ColumnsEdit = ( props ) => {
+const MetaColumnsEdit = ( props ) => {
 	const { clientId } = props;
 	const hasInnerBlocks = useSelect(
 		( select ) =>
 			select( blockEditorStore ).getBlocks( clientId ).length > 0,
 		[ clientId ]
 	);
-	const Component = hasInnerBlocks
-		? ColumnsEditContainerWrapper
-		: Placeholder;
+	const Component = hasInnerBlocks ? ColumnsEdit : Placeholder;
 
 	return <Component { ...props } />;
 };
 
-export default ColumnsEdit;
+export default MetaColumnsEdit;
