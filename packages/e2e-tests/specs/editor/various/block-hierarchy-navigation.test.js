@@ -22,9 +22,9 @@ async function tabToColumnsControl() {
 		isColumnsControl = await page.evaluate( () => {
 			const activeElement = document.activeElement;
 			return (
-				activeElement.tagName === 'INPUT' &&
-				activeElement.attributes.getNamedItem( 'aria-label' ).value ===
-					'Columns'
+				activeElement.tagName === 'BUTTON' &&
+				activeElement.parentNode.getAttribute( 'aria-label' ) ===
+					'Quantity'
 			);
 		} );
 	} while ( ! isColumnsControl );
@@ -59,12 +59,9 @@ describe( 'Navigating the block hierarchy', () => {
 		// Tweak the columns count.
 		await openDocumentSettingsSidebar();
 		await page.focus(
-			'.block-editor-block-inspector [aria-label="Columns"][type="number"]'
+			'.block-editor-block-inspector [aria-label="Quantity"] [aria-checked="true"]'
 		);
-		await page.keyboard.down( 'Shift' );
-		await page.keyboard.press( 'ArrowLeft' );
-		await page.keyboard.up( 'Shift' );
-		await page.keyboard.type( '3' );
+		await page.keyboard.press( 'ArrowRight' );
 
 		// Wait for the new column block to appear in the list view
 		// 5 = Columns, Column, Paragraph, Column, *Column*
